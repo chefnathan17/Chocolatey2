@@ -1,0 +1,243 @@
+$thisScriptFolder = (Split-Path -parent $MyInvocation.MyCommand.Definition)
+$chocInstallVariableName = "ChocolateyInstall"
+$sysDrive = $env:SystemDrive
+$tempDir = $env:TEMP
+$defaultChocolateyPathOld = "$sysDrive\Chocolatey"
+
+$originalForegroundColor = $host.ui.RawUI.ForegroundColor
+
+function Write-ChocolateyWarning {
+param (
+  [string]$message = ''
+)
+
+  try {
+    Write-Host "WARNING: $message" -ForegroundColor "Yellow" -ErrorAction "Stop"
+  } catch {
+    Write-Output "WARNING: $message"
+  }
+}
+
+function  Write-ChocolateyError {
+param (
+  [string]$message = ''
+)
+
+  try {
+    Write-Host "ERROR: $message" -ForegroundColor "Red" -ErrorAction "Stop"
+  } catch {
+    Write-Output "ERROR: $message"
+  }
+}
+
+function Initialize-Chocolatey {
+<#
+  .DESCRIPTION
+    This will initialize the Chocolatey tool by
+      a) setting up the "chocolateyPath" (the location where all chocolatey nuget packages will be installed)
+      b) Installs chocolatey into the "chocolateyPath"
+            c) Instals .net 4.0 if needed
+      d) Adds Chocolatey to the PATH environment variable so you have access to the choco commands.
+  .PARAMETER  ChocolateyPath
+    Allows you to override the default path of (C:\ProgramData\chocolatey\) by specifying a directory chocolatey will install nuget packages.
+
+  .EXAMPLE
+    C:\PS> Initialize-Chocolatey
+
+    Installs chocolatey into the default C:\ProgramData\Chocolatey\ directory.
+
+  .EXAMPLE
+    C:\PS> Initialize-Chocolatey -chocolateyPath "D:\ChocolateyInstalledNuGets\"
+
+    Installs chocolatey into the custom directory D:\ChocolateyInstalledNuGets\
+
+#>
+param(
+  [Parameter(Mandatory=$false)][string]$chocolateyPath = ''
+)
+  Write-Debug "Initialize-Chocolatey"
+
+  $installModule = Join-Path $thisScriptFolder 'chocolateyInstall\helpers\chocolateyInstaller.psm1'
+  Import-Module $installModule -Force
+
+  if ($chocolateyPath -eq '') {
+    $programData = [Environment]::GetFolderPath("CommonApplicationData")
+    $chocolateyPath = Join-Path "$programData" 'chocolatey'
+  }
+
+  # variable to allow insecure directory:
+  $allowInsecureRootInstall = $false
+  if ($env:ChocolateyAllowInsecureRootDirectory -eq 'true') { $allowInsecureRootInstall = $true }
+
+  # if we have an already environment variable path, use it.
+  $alreadyInitializedNugetPath = Get-ChocolateyInstallFolder
+  if ($alreadyInitializedNugetPath -and $alreadyInitializedNugetPath -ne $chocolateyPath -and ($allowInsecureRootInstall -or $alreadyInitializedNugetPath -ne $defaultChocolateyPathOld)){
+    $chocolateyPath = $alreadyInitializedNugetPath
+  }
+  else {
+    Set-ChocolateyInstallFolder $chocolateyPath
+  }
+  Create-DirectoryIfNotExists $chocolateyPath
+  Ensure-Permissions $chocolateyPath
+
+  #set up variables to add
+  $chocolateyExePath = Join-Path $chocolateyPath 'bin'
+  $chocolateyLibPath = Join-Path $chocolateyPath 'lib'
+
+  if ($tempDir -eq $null) {
+    $tempDir = Join-Path $chocolateyPath 'temp'
+    Create-DirectoryIfNotExists $tempDir
+  }
+
+  $yourPkgPath = [System.IO.Path]::Combine($chocolateyLibPath,"yourPackageName")
+@"
+We are setting up the Chocolatey package repository.
+The packages themselves go to `'$chocolateyLibPath`'
+  (i.e. $yourPkgPath).
+A shim file for the command line goes to `'$chocolateyExePath`'
+  and points to an executable in `'$yourPkgPath`'.
+
+Creating Chocolatey folders if they do not already exist.
+
+"@ | Write-Output
+
+  Write-ChocolateyWarning "You can safely ignore errors related to missing log files when `n  upgrading from a version of Chocolatey less than 0.9.9. `n  'Batch file could not be found' is also safe to ignore. `n  'The system cannot find the file specified' - also safe."
+
+  #create the base structure if it doesn't exist
+  Create-DirectoryIfNotExists $chocolateyExePath
+  Create-DirectoryIfNotExists $chocolateyLibPath
+
+  Install-ChocolateyFiles $chocolateyPath
+  Ensure-ChocolateyLibFiles $chocolateyLibPath
+
+  Install-ChocolateyBinFiles $chocolateyPath $chocolateyExePath
+
+  $chocolateyExePathVariable = $chocolateyExePath.ToLower().Replace($chocolateyPath.ToLower(), "%DIR%..\").Replace("\\","\")
+  Initialize-ChocolateyPath $chocolateyExePath $chocolateyExePathVariable
+  Process-ChocolateyBinFiles $chocolateyExePath $chocolateyExePathVariable
+
+  $realModule = Join-Path $chocolateyPath "helpers\chocolateyInstaller.psm1"
+  Import-Module "$realModule" -Force
+
+  if (-not $allowInsecureRootInstall -and (Test-Path($defaultChocolateyPathOld))) {
+    Upgrade-OldChocolateyInstall $defaultChocolateyPathOld $chocolateyPath
+    Install-ChocolateyBinFiles $chocolateyPath $chocolateyExePath
+  }
+
+  Add-ChocolateyProfile
+  Install-DotNet4IfMissing
+  if ($env:ChocolateyExitCode -eq $null -or $env:ChocolateyExitCode -eq '') {
+    $env:ChocolateyExitCode = 0
+  }
+
+@"
+Chocolatey (choco.exe) is now ready.
+You can call choco from anywhere, command line or powershell by typing choco.
+Run choco /? for a list of functions.
+You may need to shut down and restart powershell and/or consoles
+ first prior to using choco.
+"@ | write-Output
+
+  if (-not $allowInsecureRootInstall) {
+    Remove-OldChocolateyInstall $defaultChocolateyPathOld
+  }
+}
+
+function Set-ChocolateyInstallFolder {
+param(
+  [string]$folder
+)
+  Write-Debug "Set-ChocolateyInstallFolder"
+
+  $environmentTarget = [System.EnvironmentVariableTarget]::User
+  # removing old variable
+  Install-ChocolateyEnvironmentVariable -variableName "$chocInstallVariableName" -variableValue $null -variableType $environmentTarget
+  if (Test-ProcessAdminRights) {
+    Write-Debug "Administrator installing so using Machine environment variable target instead of User."
+    $environmentTarget = [System.EnvironmentVariableTarget]::Machine
+    # removing old variable
+    Install-ChocolateyEnvironmentVariable -variableName "$chocInstallVariableName" -variableValue $null -variableType $environmentTarget
+  } else {
+    Write-ChocolateyWarning "Setting ChocolateyInstall Environment Variable on USER and not SYSTEM variables.`n  This is due to either non-administrator install OR the process you are running is not being run as an Administrator."
+  }
+
+  Write-Output "Creating $chocInstallVariableName as an environment variable (targeting `'$environmentTarget`') `n  Setting $chocInstallVariableName to `'$folder`'"
+  Write-ChocolateyWarning "It's very likely you will need to close and reopen your shell `n  before you can use choco."
+  Install-ChocolateyEnvironmentVariable -variableName "$chocInstallVariableName" -variableValue "$folder" -variableType $environmentTarget
+}
+
+function Get-ChocolateyInstallFolder(){
+  Write-Debug "Get-ChocolateyInstallFolder"
+  [Environment]::GetEnvironmentVariable($chocInstallVariableName)
+}
+
+function Create-DirectoryIfNotExists($folderName){
+  Write-Debug "Create-DirectoryIfNotExists"
+  if (![System.IO.Directory]::Exists($folderName)) { [System.IO.Directory]::CreateDirectory($folderName) | Out-Null }
+}
+
+function Get-LocalizedWellKnownPrincipalName {
+param (
+  [Parameter(Mandatory = $true)]
+  [Security.Principal.WellKnownSidType] $WellKnownSidType
+)
+  $sid = New-Object -TypeName 'System.Security.Principal.SecurityIdentifier' -ArgumentList @($WellKnownSidType, $null)
+  $account = $sid.Translate([Security.Principal.NTAccount])
+
+  return $account.Value
+}
+
+function Ensure-Permissions {
+param(
+  [string]$folder
+)  Write-Debug "Ensure-Permissions"
+
+  $defaultInstallPath = "$env:SystemDrive\ProgramData\chocolatey"
+  try {
+    $defaultInstallPath = Join-Path [Environment]::GetFolderPath("CommonApplicationData") 'chocolatey'
+  } catch {
+      # keep first setting
+  }
+
+  if ($folder.ToLower() -ne $defaultInstallPath.ToLower()) {
+    Write-ChocolateyWarning "Installation folder is not the default. Not changing permissions. Please ensure your installation is secure."
+    return
+  }
+
+  # Everything from here on out applies to the default installation folder
+
+  if (!(Test-ProcessAdminRights)) {
+    throw "Installation of Chocolatey to default folder requires Administrative permissions. Please run from elevated prompt. Please see https://chocolatey.org/install for details and alternatives if needing to install as a non-administrator."
+  }
+
+  $currentEA = $ErrorActionPreference
+  $ErrorActionPreference = 'Stop'
+  try {
+    # get current acl
+    $acl = (Get-Item $folder).GetAccessControl('Access,Owner')
+
+    Write-Debug "Removing existing permissions."
+    $acl.Access | % { $acl.RemoveAccessRuleAll($_) }
+
+    $inheritanceFlags = ([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit)
+    $propagationFlags = [Security.AccessControl.PropagationFlags]::None
+
+    $rightsFullControl = [Security.AccessControl.FileSystemRights]::FullControl
+    $rightsModify = [Security.AccessControl.FileSystemRights]::Modify
+    $rightsReadExecute = [Security.AccessControl.FileSystemRights]::ReadAndExecute
+    $rightsWrite = [Security.AccessControl.FileSystemRights]::Write
+
+    Write-Output "Restricting write permissions to Administrators"
+    $builtinAdmins = Get-LocalizedWellKnownPrincipalName -WellKnownSidType ([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid)
+    $adminsAccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($builtinAdmins, $rightsFullControl, $inheritanceFlags, $propagationFlags, "Allow")
+    $acl.SetAccessRule($adminsAccessRule)
+    $localSystem = Get-LocalizedWellKnownPrincipalName -WellKnownSidType ([Security.Principal.WellKnownSidType]::LocalSystemSid)
+    $localSystemAccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($localSystem, $rightsFullControl, $inheritanceFlags, $propagationFlags, "Allow")
+    $acl.SetAccessRule($localSystemAccessRule)
+    $builtinUsers = Get-LocalizedWellKnownPrincipalName -WellKnownSidType ([Security.Principal.WellKnownSidType]::BuiltinUsersSid)
+    $usersAccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($builtinUsers, $rightsReadExecute, $inheritanceFlags, $propagationFlags, "Allow")
+    $acl.SetAccessRule($usersAccessRule)
+
+    $allowCurrentUser = $env:ChocolateyInstallAllowCurrentUser -eq 'true'
+
+*** The rest of the content is truncated. ***
